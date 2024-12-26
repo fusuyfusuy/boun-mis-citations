@@ -1,0 +1,4 @@
+- get urls of the people
+- get data from the people pages
+- parse data
+- get excel? or csv
