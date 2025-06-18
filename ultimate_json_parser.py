@@ -4,6 +4,45 @@ import csv
 import html
 from collections import defaultdict
 
+# Translation mappings
+TRANSLATIONS = {
+    'international_articles': {
+        'en': 'International Articles',
+        'tr': 'Uluslararası Makaleler'
+    },
+    'international_book_chapters': {
+        'en': 'International Book Chapters', 
+        'tr': 'Uluslararası Kitap Bölümleri'
+    },
+    'international_conference_papers': {
+        'en': 'International Conference Paper',
+        'tr': 'Uluslararası Bildiriler'
+    },
+    'national_conference_papers': {
+        'en': 'National Conference Paper',
+        'tr': 'Ulusal Bildiriler'  
+    },
+    'national_articles': {
+        'en': 'National Articles',
+        'tr': 'Ulusal Makaleler'
+    },
+    'national_books': {
+        'en': 'National Books',
+        'tr': 'Ulusal Kitaplar'
+    },
+    'national_conferences': {
+        'en': 'National Conferences', 
+        'tr': 'Ulusal Konferanslar'
+    }
+}
+
+def get_category_name(category_key, language='en'):
+    """Get translated category name."""
+    if category_key in TRANSLATIONS:
+        return TRANSLATIONS[category_key][language]
+    # Fallback: clean up the key
+    return category_key.replace('_', ' ').title()
+
 def extract_year(citation_text):
     """Extract year from citation - looks for (YYYY) format first."""
     # Try (YYYY) format first - most common in academic citations
@@ -54,31 +93,32 @@ def parse_citations(json_file):
     
     return dict(organized)
 
-def save_to_csv(organized_citations, filename):
+def save_to_csv(organized_citations, filename, language='en'):
     """Save citations to CSV file."""
     with open(filename, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Category', 'Year', 'Author', 'Citation'])
         
         for category, years in organized_citations.items():
+            category_name = get_category_name(category, language)
             for year, citations in years.items():
                 for citation in citations:
                     writer.writerow([
-                        category.replace('_', ' ').title(),
+                        category_name,
                         year,
                         citation['author'],
                         citation['text']
                     ])
 
-def save_to_html(organized_citations, filename):
+def save_to_html(organized_citations, filename, language='en'):
     """Save citations to HTML file."""
     with open(filename, 'w', encoding='utf-8') as f:
         for category, years in organized_citations.items():
             # Count total citations in this category
             total_count = sum(len(citations) for citations in years.values())
             
-            # Category header
-            category_name = category.replace('_', ' ').title()
+            # Category header with translation
+            category_name = get_category_name(category, language)
             f.write(f'<h1><strong>{category_name} ({total_count} articles)</strong></h1>')
             
             # Years and citations
@@ -112,7 +152,7 @@ def print_metadata(organized_citations):
             category_total += count
             total_citations += count
         
-        print(f"\n{category.replace('_', ' ').title()}: {category_total} total citations")
+        print(f"\n{get_category_name(category, 'en')}: {category_total} total citations")
         # Show year breakdown for this category
         for year in sorted(years.keys(), reverse=True):
             print(f"  {year}: {len(years[year])} citations")
@@ -137,7 +177,7 @@ def print_summary(organized_citations):
     for category, years in organized_citations.items():
         cat_total = sum(len(citations) for citations in years.values())
         total += cat_total
-        print(f"{category.replace('_', ' ').title()}: {cat_total} citations")
+        print(f"{get_category_name(category, 'en')}: {cat_total} citations")
     
     print(f"Total citations with years: {total}")
 
@@ -154,19 +194,24 @@ def main():
         # Print detailed metadata
         print_metadata(organized)
         
-        # Save to CSV
-        save_to_csv(organized, 'citations.csv')
-        print("✓ Saved to citations.csv")
+        # Save to CSV (both languages)
+        save_to_csv(organized, 'citations_en.csv', 'en')
+        save_to_csv(organized, 'citations_tr.csv', 'tr')
+        print("✓ Saved to citations_en.csv (English)")
+        print("✓ Saved to citations_tr.csv (Turkish)")
         
-        # Save to HTML
-        save_to_html(organized, 'citations.html')
-        print("✓ Saved to citations.html")
+        # Save to HTML (both languages)
+        save_to_html(organized, 'citations_en.html', 'en')
+        save_to_html(organized, 'citations_tr.html', 'tr')
+        print("✓ Saved to citations_en.html (English)")
+        print("✓ Saved to citations_tr.html (Turkish)")
         
         # Show example
         if organized:
             first_category = list(organized.keys())[0]
             first_year = list(organized[first_category].keys())[0]
-            print(f"\nExample: {first_category} in {first_year}:")
+            category_name = get_category_name(first_category, 'en')
+            print(f"\nExample: {category_name} in {first_year}:")
             for i, citation in enumerate(organized[first_category][first_year][:2], 1):
                 print(f"{i}. {citation['author']}: {citation['text'][:80]}...")
         
