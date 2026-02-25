@@ -1,14 +1,17 @@
-import json
-import re
+import argparse
 import csv
+import functools
+import hashlib
 import html
+import json
 import logging
+import re
+from tqdm import tqdm
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Set, Tuple
+from datetime import datetime, timezone
 from pathlib import Path
-from difflib import SequenceMatcher
-import hashlib
+from typing import Dict, List, Optional, Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +23,31 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Citation:
     """Represents a single citation with metadata and duplicate detection."""
+
+    # Pre-compiled regex patterns (class-level)
+    _RE_YEAR_PAREN = re.compile(r'\((\d{4})\)')
+    _RE_YEAR_BARE = re.compile(r'\b(\d{4})\b')
+    _RE_REMOVE_ALL = re.compile(
+        r'https?://[^\s]+'        # URLs
+        r'|doi:\s*'               # DOI prefix
+        r'|\([^)]*\)'             # Parenthetical
+        r'|vol\.\s*\d+'           # Volume
+        r"|pp?\.\s*\d+[-\u2013]\d+"  # Pages
+    )
+    _RE_NORMALIZE = re.compile(r'[&.,;:!?"\s]+')
+    _RE_DOI_PATTERNS = [
+        re.compile(r'doi:\s*([0-9.]+/[^\s,)]+)', re.IGNORECASE),
+        re.compile(r'https?://doi\.org/([0-9.]+/[^\s,)]+)', re.IGNORECASE),
+        re.compile(r'https?://dx\.doi\.org/([0-9.]+/[^\s,)]+)', re.IGNORECASE),
+        re.compile(r'\b(10\.[0-9]+/[^\s,)]+)', re.IGNORECASE),
+    ]
+    _RE_QUOTED_TITLE = re.compile(r'"([^"]+)"')
+    _RE_TITLE_PATTERNS = [
+        re.compile(r'(?:\.|\))\s+([^.]+?)\.\s+[A-Z][^.]+(?:Journal|Conference|Proceedings)'),
+        re.compile(r'(?:\.|\))\s+([^.]+?)\s+\(\d{4}\)'),
+    ]
+    _RE_NON_ALNUM = re.compile(r'[^\w\s]')
+
     text: str
     author: str
     year: Optional[int] = None
@@ -28,7 +56,7 @@ class Citation:
     fingerprint: str = field(init=False)
     doi: Optional[str] = field(init=False, default=None)
     title: Optional[str] = field(init=False, default=None)
-    
+
     def __post_init__(self):
         if self.year is None:
             self.year = self._extract_year()
@@ -36,120 +64,99 @@ class Citation:
         self.doi = self._extract_doi()
         self.title = self._extract_title()
         self.fingerprint = self._generate_fingerprint()
-    
+
     def _extract_year(self) -> Optional[int]:
         """Extract year from citation text."""
-        # Try (YYYY) format first - most common in academic citations
-        match = re.search(r'\((\d{4})\)', self.text)
+        match = self._RE_YEAR_PAREN.search(self.text)
         if match:
             year = int(match.group(1))
-            if 1950 <= year <= 2030:  # Valid range
-                return year
-        
-        # Fallback: find any 4-digit number in valid range
-        numbers = re.findall(r'\b(\d{4})\b', self.text)
-        for num in numbers:
-            year = int(num)
             if 1950 <= year <= 2030:
                 return year
-        
+
+        for m in self._RE_YEAR_BARE.finditer(self.text):
+            year = int(m.group(1))
+            if 1950 <= year <= 2030:
+                return year
+
         return None
-    
+
     def _normalize_text(self) -> str:
         """Normalize citation text for comparison."""
-        text = self.text.lower()
-        
-        # Remove common variations
-        text = re.sub(r'[&\s]+', ' ', text)  # Normalize spaces and ampersands
-        text = re.sub(r'[.,;:!?"]', '', text)  # Remove punctuation
-        text = re.sub(r'\s+', ' ', text)  # Multiple spaces to single
-        text = re.sub(r'doi:\s*', '', text)  # Remove DOI prefix
-        text = re.sub(r'https?://[^\s]+', '', text)  # Remove URLs
-        text = re.sub(r'\([^)]*\)', '', text)  # Remove parenthetical content
-        text = re.sub(r'vol\.\s*\d+', '', text)  # Remove volume info
-        text = re.sub(r'pp?\.\s*\d+[-–]\d+', '', text)  # Remove page numbers
-        
+        text = self._RE_REMOVE_ALL.sub(' ', self.text.lower())
+        text = self._RE_NORMALIZE.sub(' ', text)
         return text.strip()
-    
+
     def _extract_doi(self) -> Optional[str]:
         """Extract DOI from citation text."""
-        # Common DOI patterns
-        patterns = [
-            r'doi:\s*([0-9.]+/[^\s,)]+)',
-            r'https?://doi\.org/([0-9.]+/[^\s,)]+)',
-            r'https?://dx\.doi\.org/([0-9.]+/[^\s,)]+)',
-            r'\b(10\.[0-9]+/[^\s,)]+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, self.text, re.IGNORECASE)
+        for pattern in self._RE_DOI_PATTERNS:
+            match = pattern.search(self.text)
             if match:
-                doi = match.group(1)
-                # Clean up DOI
-                doi = doi.rstrip('.,;)')
+                doi = match.group(1).rstrip('.,;)')
                 return doi.lower()
-        
         return None
-    
+
     def _extract_title(self) -> Optional[str]:
         """Extract title from citation text."""
-        # Try to find quoted title
-        quoted_match = re.search(r'"([^"]+)"', self.text)
+        quoted_match = self._RE_QUOTED_TITLE.search(self.text)
         if quoted_match:
             return quoted_match.group(1).strip()
-        
-        # Try to find title before journal name or year
-        # This is a simple heuristic and might need refinement
-        patterns = [
-            r'(?:\.|\))\s+([^.]+?)\.\s+[A-Z][^.]+(?:Journal|Conference|Proceedings)',
-            r'(?:\.|\))\s+([^.]+?)\s+\(\d{4}\)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, self.text)
+
+        for pattern in self._RE_TITLE_PATTERNS:
+            match = pattern.search(self.text)
             if match:
                 title = match.group(1).strip()
-                if len(title) > 10:  # Reasonable title length
+                if len(title) > 10:
                     return title
-        
+
         return None
     
+    @functools.cached_property
+    def _word_tokens(self) -> frozenset:
+        """Pre-computed word token set for Jaccard similarity."""
+        return frozenset(self.normalized_text.split())
+
     def _generate_fingerprint(self) -> str:
         """Generate a unique fingerprint for duplicate detection."""
         # Use DOI as primary identifier
         if self.doi:
             return hashlib.md5(f"doi:{self.doi}".encode()).hexdigest()
-        
+
         # Fallback to normalized text + year
         fingerprint_text = f"{self.normalized_text}:{self.year or 'no_year'}"
         return hashlib.md5(fingerprint_text.encode()).hexdigest()
-    
+
     def similarity_score(self, other: 'Citation') -> float:
         """Calculate similarity score with another citation (0-1)."""
         if not isinstance(other, Citation):
             return 0.0
-        
+
         # DOI match is definitive
         if self.doi and other.doi and self.doi == other.doi:
             return 1.0
-        
+
         # Title match with same year is very strong
         if (self.title and other.title and self.year == other.year and
             self._normalize_string(self.title) == self._normalize_string(other.title)):
             return 0.95
-        
-        # Text similarity
-        similarity = SequenceMatcher(None, self.normalized_text, other.normalized_text).ratio()
-        
+
+        # Token-set Jaccard similarity (O(n+m) vs SequenceMatcher O(n*m))
+        self_tokens = self._word_tokens
+        other_tokens = other._word_tokens
+        if not self_tokens or not other_tokens:
+            return 0.0
+        intersection = len(self_tokens & other_tokens)
+        union = len(self_tokens | other_tokens)
+        similarity = intersection / union
+
         # Boost similarity if years match
         if self.year and other.year and self.year == other.year:
             similarity = min(1.0, similarity + 0.1)
-        
+
         return similarity
     
     def _normalize_string(self, text: str) -> str:
         """Normalize string for comparison."""
-        return re.sub(r'[^\w\s]', '', text.lower()).strip()
+        return self._RE_NON_ALNUM.sub('', text.lower()).strip()
     
     def is_duplicate_of(self, other: 'Citation', threshold: float = 0.85) -> bool:
         """Check if this citation is a duplicate of another."""
@@ -164,6 +171,26 @@ class AnalysisConfig:
     year_range: tuple = (1950, 2030)
     output_formats: List[str] = field(default_factory=lambda: ['csv', 'html', 'json'])
     
+    # Category display order (categories not listed here appear at the end)
+    category_order: List[str] = field(default_factory=lambda: [
+        'international_articles',
+        'international_conference_papers',
+        'international_book_chapters',
+        'national_articles',
+        'national_conference_papers',
+        'national_books',
+        'national_conferences',
+    ])
+
+    # HTML anchor names per category
+    category_anchors: Dict[str, str] = field(default_factory=lambda: {
+        'international_articles': 'international-paper',
+        'national_articles': 'national-paper',
+        'international_conference_papers': 'international-conference',
+        'international_book_chapters': 'international-book',
+        'national_conference_papers': 'national-conference',
+    })
+
     # Duplicate detection settings
     enable_duplicate_detection: bool = True
     similarity_threshold: float = 0.85
@@ -238,7 +265,7 @@ class CitationAnalyzer:
     
     def _parse_citations(self, faculty_data: List[Dict]) -> None:
         """Parse citations from faculty data."""
-        for faculty in faculty_data:
+        for faculty in tqdm(faculty_data, desc="Parsing citations", unit="faculty"):
             if 'citations' not in faculty:
                 logger.warning(f"No citations found for faculty: {faculty.get('name', 'Unknown')}")
                 continue
@@ -269,7 +296,7 @@ class CitationAnalyzer:
         for citation in self.citations:
             fingerprint_groups[citation.fingerprint].append(citation)
         
-        for fingerprint, group in fingerprint_groups.items():
+        for fingerprint, group in tqdm(fingerprint_groups.items(), desc="Deduplicating (fingerprint)", unit="group"):
             if len(group) == 1:
                 # No duplicates for this fingerprint
                 unique_citations.extend(group)
@@ -284,7 +311,11 @@ class CitationAnalyzer:
             unique_citations = self._remove_similar_duplicates(unique_citations)
         
         self.citations = unique_citations
-        
+
+        # Invalidate cached statistics
+        if hasattr(self, '_cached_stats'):
+            del self._cached_stats
+
         # Organize the deduplicated citations
         self._organize_citations()
         
@@ -326,31 +357,30 @@ class CitationAnalyzer:
         return kept_citations, removed_pairs
     
     def _remove_similar_duplicates(self, citations: List[Citation]) -> List[Citation]:
-        """Remove similar duplicates using similarity threshold."""
+        """Remove similar duplicates using similarity threshold, pre-filtered by year."""
+        # Group by year to reduce pairwise comparisons
+        by_year: Dict[Optional[int], List[Citation]] = {}
+        for c in citations:
+            by_year.setdefault(c.year, []).append(c)
+
         unique_citations = []
-        
-        for i, citation in enumerate(citations):
-            is_duplicate = False
-            
-            # Compare with already accepted unique citations
-            for unique_citation in unique_citations:
-                if citation.is_duplicate_of(unique_citation, self.config.similarity_threshold):
-                    # Decide which one to keep
-                    if self._should_replace(unique_citation, citation):
-                        # Replace the existing one
-                        unique_citations.remove(unique_citation)
-                        unique_citations.append(citation)
-                        self.duplicates_removed.append((citation, unique_citation))
-                    else:
-                        # Keep the existing one
-                        self.duplicates_removed.append((unique_citation, citation))
-                    
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                unique_citations.append(citation)
-        
+        for year, group in tqdm(by_year.items(), desc="Deduplicating (similarity)", unit="year-group"):
+            for citation in group:
+                is_duplicate = False
+                for idx, u in enumerate(unique_citations):
+                    if u.year != citation.year:
+                        continue
+                    if citation.is_duplicate_of(u, self.config.similarity_threshold):
+                        if self._should_replace(u, citation):
+                            unique_citations[idx] = citation
+                            self.duplicates_removed.append((citation, u))
+                        else:
+                            self.duplicates_removed.append((u, citation))
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_citations.append(citation)
+
         return unique_citations
     
     def _should_replace(self, existing: Citation, new: Citation) -> bool:
@@ -389,6 +419,17 @@ class CitationAnalyzer:
                 reverse=True
             ))
     
+    def _ordered_categories(self):
+        """Yield (category, years_dict) in configured display order."""
+        seen = set()
+        for cat in self.config.category_order:
+            if cat in self.organized_data:
+                seen.add(cat)
+                yield cat, self.organized_data[cat]
+        for cat, years in self.organized_data.items():
+            if cat not in seen:
+                yield cat, years
+
     def _save_duplicate_report(self) -> None:
         """Save detailed duplicate report."""
         if not self.duplicates_removed:
@@ -448,34 +489,40 @@ class CitationAnalyzer:
         return category_key.replace('_', ' ').title()
     
     def generate_statistics(self) -> Dict:
-        """Generate comprehensive statistics."""
+        """Generate comprehensive statistics (cached)."""
+        if hasattr(self, '_cached_stats'):
+            return self._cached_stats
+
+        years_count: Dict[int, int] = {}
+        authors_count: Dict[str, int] = {}
+
+        for citation in self.citations:
+            if citation.year:
+                years_count[citation.year] = years_count.get(citation.year, 0) + 1
+            authors_count[citation.author] = authors_count.get(citation.author, 0) + 1
+
         stats = {
             'total_citations': len(self.citations),
             'citations_with_years': len([c for c in self.citations if c.year]),
             'citations_without_years': len([c for c in self.citations if not c.year]),
             'categories': {},
-            'years': defaultdict(int),
-            'authors': defaultdict(int),
+            'years': years_count,
+            'authors': authors_count,
             'duplicate_info': self.get_duplicate_statistics()
         }
-        
+
         # Category statistics
         for category, years in self.organized_data.items():
             category_total = sum(len(citations) for citations in years.values())
             stats['categories'][category] = {
                 'total': category_total,
-                'years': dict(years.keys()) if years else {},
+                'years': list(years.keys()) if years else [],
                 'year_range': (min(years.keys()), max(years.keys())) if years else None
             }
-        
-        # Year and author statistics
-        for citation in self.citations:
-            if citation.year:
-                stats['years'][citation.year] += 1
-            stats['authors'][citation.author] += 1
-        
+
+        self._cached_stats = stats
         return stats
-    
+
     def save_to_csv(self, language: str = 'en') -> None:
         """Save citations to CSV file."""
         filename = Path(self.config.output_dir) / f'citations_{language}.csv'
@@ -485,7 +532,7 @@ class CitationAnalyzer:
                 writer = csv.writer(f)
                 writer.writerow(['Category', 'Year', 'Author', 'Citation'])
                 
-                for category, years in self.organized_data.items():
+                for category, years in tqdm(self._ordered_categories(), desc=f"Saving csv ({language})", unit="category"):
                     category_name = self.get_category_name(category, language)
                     for year, citations in years.items():
                         for citation in citations:
@@ -503,107 +550,32 @@ class CitationAnalyzer:
             raise
     
     def save_to_html(self, language: str = 'en') -> None:
-        """Save citations to styled HTML file."""
+        """Save citations to plain HTML file (no CSS, meant for embedding)."""
         filename = Path(self.config.output_dir) / f'citations_{language}.html'
-        
+
         try:
             with open(filename, 'w', encoding='utf-8') as f:
-                # HTML header with CSS
-                f.write(self._get_html_header(language))
-                
-                for category, years in self.organized_data.items():
+                for category, years in tqdm(self._ordered_categories(), desc=f"Saving html ({language})", unit="category"):
                     total_count = sum(len(citations) for citations in years.values())
                     category_name = self.get_category_name(category, language)
-                    
-                    f.write(f'<div class="category">')
-                    f.write(f'<h1>{category_name} <span class="count">({total_count} articles)</span></h1>')
-                    
+
+                    anchor = self.config.category_anchors.get(category, '')
+                    if anchor:
+                        f.write(f'<h1><a name="{anchor}">{category_name} <strong class="count">({total_count})</strong></a></h1>\n')
+                    else:
+                        f.write(f'<h1>{category_name} <strong class="count">({total_count})</strong></h1>\n')
+
                     for year, citations in years.items():
-                        f.write(f'<div class="year-section">')
-                        f.write(f'<h2>{year} <span class="year-count">({len(citations)} articles)</span></h2>')
-                        f.write('<ol class="citations">')
-                        
+                        f.write(f'<h3>{year} ({len(citations)})</h3>\n')
+                        f.write('<ol>\n')
                         for citation in citations:
-                            escaped_citation = html.escape(citation.text)
-                            f.write(f'<li class="citation">')
-                            f.write(f'<span class="author">{html.escape(citation.author)}:</span> ')
-                            f.write(f'{escaped_citation}')
-                            f.write(f'</li>')
-                        
-                        f.write('</ol>')
-                        f.write('</div>')
-                    
-                    f.write('</div>')
-                
-                f.write('</body></html>')
-            
+                            f.write(f'  <li>{html.escape(citation.text)}</li>\n')
+                        f.write('</ol>\n')
+
             logger.info(f"Saved HTML to {filename}")
-            
+
         except Exception as e:
             logger.error(f"Error saving HTML: {e}")
-            raise
-    
-    def _get_html_header(self, language: str) -> str:
-        """Generate HTML header with CSS styling."""
-        title = "Faculty Citations" if language == 'en' else "Fakülte Yayınları"
-        
-        return f"""<!DOCTYPE html>
-<html lang="{language}">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title}</title>
-    <style>
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            line-height: 1.6;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }}
-        .category {{
-            background: white;
-            margin: 20px 0;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        h1 {{
-            color: #2c3e50;
-            border-bottom: 3px solid #3498db;
-            padding-bottom: 10px;
-        }}
-        h2 {{
-            color: #34495e;
-            margin-top: 30px;
-        }}
-        .count, .year-count {{
-            color: #7f8c8d;
-            font-weight: normal;
-            font-size: 0.9em;
-        }}
-        .citations {{
-            margin: 15px 0;
-        }}
-        .citation {{
-            margin: 10px 0;
-            padding: 10px;
-            background: #f8f9fa;
-            border-left: 4px solid #3498db;
-            border-radius: 4px;
-        }}
-        .author {{
-            font-weight: bold;
-            color: #2980b9;
-        }}
-        .year-section {{
-            margin: 20px 0;
-        }}
-    </style>
-</head>
-<body>
-<h1 style="text-align: center; color: #2c3e50;">{title}</h1>
-"""
     
     def save_to_json(self) -> None:
         """Save organized data and statistics to JSON."""
@@ -615,12 +587,12 @@ class CitationAnalyzer:
             'organized_data': {},
             'metadata': {
                 'total_citations': len(self.citations),
-                'generation_time': str(Path(filename).stat().st_mtime) if filename.exists() else None
+                'generation_time': datetime.now(timezone.utc).isoformat()
             }
         }
         
         # Convert citations to dict format
-        for category, years in self.organized_data.items():
+        for category, years in self._ordered_categories():
             data['organized_data'][category] = {}
             for year, citations in years.items():
                 data['organized_data'][category][str(year)] = [
@@ -704,27 +676,30 @@ class CitationAnalyzer:
 
 def main():
     """Main execution function."""
-    # Configuration can be customized here or loaded from file
+    parser = argparse.ArgumentParser(description="Parse and analyze faculty citation data")
+    parser.add_argument("--input", default="complete_faculty_data.json", help="Input JSON file from faculty_scraper.py")
+    parser.add_argument("--output-dir", default="citation_analysis_output", help="Directory for output files")
+    parser.add_argument("--threshold", type=float, default=0.85, help="Similarity threshold for duplicate detection (0.0-1.0)")
+    args = parser.parse_args()
+
     config = AnalysisConfig(
-        input_file="complete_faculty_data.json",
-        output_dir="citation_analysis_output",
+        input_file=args.input,
+        output_dir=args.output_dir,
         languages=['en', 'tr'],
         output_formats=['csv', 'html', 'json'],
-        # Duplicate detection settings
         enable_duplicate_detection=True,
-        similarity_threshold=0.85,  # Adjust this value (0.0-1.0) for strictness
-        duplicate_strategy="keep_most_complete",  # or "keep_first", "keep_longest"
-        report_duplicates=True
+        similarity_threshold=args.threshold,
+        duplicate_strategy="keep_most_complete",
+        report_duplicates=True,
     )
-    
+
     try:
         analyzer = CitationAnalyzer(config)
         analyzer.analyze()
-        
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
         return 1
-    
+
     return 0
 
 if __name__ == "__main__":
