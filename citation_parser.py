@@ -412,12 +412,14 @@ class CitationAnalyzer:
             else:
                 logger.warning(f"Could not extract year from: {citation.text[:50]}...")
         
-        # Sort years (newest first)
+        # Sort years (newest first), citations within each year alphabetically
         for category in self.organized_data:
             self.organized_data[category] = dict(sorted(
-                self.organized_data[category].items(), 
+                self.organized_data[category].items(),
                 reverse=True
             ))
+            for year in self.organized_data[category]:
+                self.organized_data[category][year].sort(key=lambda c: c.text.lower())
     
     def _ordered_categories(self):
         """Yield (category, years_dict) in configured display order."""
