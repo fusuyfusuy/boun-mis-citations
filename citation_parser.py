@@ -41,7 +41,7 @@ class Citation:
         re.compile(r'https?://dx\.doi\.org/([0-9.]+/[^\s,)]+)', re.IGNORECASE),
         re.compile(r'\b(10\.[0-9]+/[^\s,)]+)', re.IGNORECASE),
     ]
-    _RE_QUOTED_TITLE = re.compile(r'"([^"]+)"')
+    _RE_QUOTED_TITLE = re.compile(r'["\u201c]([^"\u201d]+)["\u201d]')
     _RE_TITLE_PATTERNS = [
         re.compile(r'(?:\.|\))\s+([^.]+?)\.\s+[A-Z][^.]+(?:Journal|Conference|Proceedings)'),
         re.compile(r'(?:\.|\))\s+([^.]+?)\s+\(\d{4}\)'),
@@ -117,11 +117,8 @@ class Citation:
 
     def _generate_fingerprint(self) -> str:
         """Generate a unique fingerprint for duplicate detection."""
-        # Use DOI as primary identifier
         if self.doi:
             return hashlib.md5(f"doi:{self.doi}".encode()).hexdigest()
-
-        # Fallback to normalized text + year
         fingerprint_text = f"{self.normalized_text}:{self.year or 'no_year'}"
         return hashlib.md5(fingerprint_text.encode()).hexdigest()
 
@@ -174,12 +171,10 @@ class AnalysisConfig:
     # Category display order (categories not listed here appear at the end)
     category_order: List[str] = field(default_factory=lambda: [
         'international_articles',
-        'international_conference_papers',
         'international_book_chapters',
         'national_articles',
+        'international_conference_papers',
         'national_conference_papers',
-        'national_books',
-        'national_conferences',
     ])
 
     # HTML anchor names per category
@@ -213,7 +208,7 @@ class AnalysisConfig:
         },
         'national_conference_papers': {
             'en': 'National Conference Papers',
-            'tr': 'Ulusal Bildiriler'  
+            'tr': 'Ulusal Bildiriler'
         },
         'national_articles': {
             'en': 'National Articles',
