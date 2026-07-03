@@ -1,12 +1,7 @@
-# Generated data files
-*.json
-*.csv
-*.html
-
 # UV / Python
 .venv/
 __pycache__/
 *.pyc
 
 # Output directories
-citation_analysis_output/
+outputs/
