@@ -3,6 +3,12 @@
 __pycache__/
 *.pyc
 
+# Local / IDE files
+.DS_Store
+.claude/
+.idea/
+.vscode/
+
 # Output directories
 outputs/*
 **/outputs
